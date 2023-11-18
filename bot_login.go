@@ -111,16 +111,15 @@ func NewRetryLoginOption() BotLoginOption {
 	return &RetryLoginOption{MaxRetryCount: 1}
 }
 
-// withModeOption 指定使用哪种客户端模式
-type withModeOption struct {
-	mode Mode
+type BotPreparerFunc func(*Bot)
+
+func (f BotPreparerFunc) Prepare(b *Bot) {
+	f(b)
 }
 
-// Prepare 实现了 BotLoginOption 接口
-func (w withModeOption) Prepare(b *Bot) { b.Caller.Client.SetMode(w.mode) }
-
+// withMode 是一个 BotPreparerFunc，用于设置 Bot 的模式
 func withMode(mode Mode) BotPreparer {
-	return withModeOption{mode: mode}
+	return BotPreparerFunc(func(b *Bot) { b.Caller.Client.SetMode(mode) })
 }
 
 // btw, 这两个变量已经变了4回了, 但是为了兼容以前的代码, 还是得想着法儿让用户无感知的更新
@@ -132,17 +131,22 @@ var (
 	Desktop = withMode(desktop)
 )
 
-// WithContextOption 指定一个 context.Context 用于Bot的生命周期
-type WithContextOption struct {
-	Ctx context.Context
-}
-
-// Prepare 实现了 BotLoginOption 接口
-func (w WithContextOption) Prepare(b *Bot) {
-	if w.Ctx == nil {
+// WithContextOption 是一个 BotPreparerFunc，用于设置 Bot 的 context
+func WithContextOption(ctx context.Context) BotPreparer {
+	if ctx == nil {
 		panic("context is nil")
 	}
-	b.context, b.cancel = context.WithCancel(w.Ctx)
+	return BotPreparerFunc(func(b *Bot) { b.context, b.cancel = context.WithCancel(ctx) })
+}
+
+// WithUUIDOption 是一个 BotPreparerFunc，用于设置 Bot 的 登录 uuid
+func WithUUIDOption(uuid string) BotPreparer {
+	return BotPreparerFunc(func(b *Bot) { b.loginUUID = uuid })
+}
+
+// WithDeviceID 是一个 BotPreparerFunc，用于设置 Bot 的 设备 id
+func WithDeviceID(deviceId string) BotPreparer {
+	return BotPreparerFunc(func(b *Bot) { b.deviceId = deviceId })
 }
 
 // BotLogin 定义了一个Login的接口
@@ -152,20 +156,18 @@ type BotLogin interface {
 
 // ScanLogin 扫码登录
 type ScanLogin struct {
-	UUID *string
+	UUID string
 }
 
 // Login 实现了 BotLogin 接口
 func (s *ScanLogin) Login(bot *Bot) error {
-	var uuid string
-	if s.UUID == nil {
+	var uuid = s.UUID
+	if uuid == "" {
 		var err error
-		uuid, err = bot.Caller.GetLoginUUID()
+		uuid, err = bot.Caller.GetLoginUUID(bot.Context())
 		if err != nil {
 			return err
 		}
-	} else {
-		uuid = *s.UUID
 	}
 	return s.checkLogin(bot, uuid)
 }
@@ -183,6 +185,11 @@ func (s *ScanLogin) checkLogin(bot *Bot, uuid string) error {
 	return loginChecker.CheckLogin()
 }
 
+func botReload(bot *Bot, storage HotReloadStorage) error {
+	bot.hotReloadStorage = storage
+	return bot.reload()
+}
+
 // HotLogin 热登录模式
 type HotLogin struct {
 	storage HotReloadStorage
@@ -190,15 +197,10 @@ type HotLogin struct {
 
 // Login 实现了 BotLogin 接口
 func (h *HotLogin) Login(bot *Bot) error {
-	if err := h.hotLoginInit(bot); err != nil {
+	if err := botReload(bot, h.storage); err != nil {
 		return err
 	}
-	return bot.WebInit()
-}
-
-func (h *HotLogin) hotLoginInit(bot *Bot) error {
-	bot.hotReloadStorage = h.storage
-	return bot.reload()
+	return bot.webInit()
 }
 
 // PushLogin 免扫码登录模式
@@ -208,10 +210,10 @@ type PushLogin struct {
 
 // Login 实现了 BotLogin 接口
 func (p *PushLogin) Login(bot *Bot) error {
-	if err := p.pushLoginInit(bot); err != nil {
+	if err := botReload(bot, p.storage); err != nil {
 		return err
 	}
-	resp, err := bot.Caller.WebWxPushLogin(bot.Storage.LoginInfo.WxUin)
+	resp, err := bot.Caller.WebWxPushLogin(bot.Context(), bot.Storage.LoginInfo.WxUin)
 	if err != nil {
 		return err
 	}
@@ -219,11 +221,6 @@ func (p *PushLogin) Login(bot *Bot) error {
 		return err
 	}
 	return p.checkLogin(bot, resp.UUID)
-}
-
-func (p *PushLogin) pushLoginInit(bot *Bot) error {
-	bot.hotReloadStorage = p.storage
-	return bot.reload()
 }
 
 // checkLogin 登录检查
@@ -256,7 +253,7 @@ func (l *LoginChecker) CheckLogin() error {
 	var tip = l.Tip
 	for {
 		// 长轮询检查是否扫码登录
-		resp, err := l.Bot.Caller.CheckLogin(uuid, tip)
+		resp, err := l.Bot.Caller.CheckLogin(l.Bot.Context(), uuid, tip)
 		if err != nil {
 			return err
 		}
@@ -274,7 +271,7 @@ func (l *LoginChecker) CheckLogin() error {
 			if err != nil {
 				return err
 			}
-			if err = l.Bot.HandleLogin(redirectURL); err != nil {
+			if err = l.Bot.loginFromURL(redirectURL); err != nil {
 				return err
 			}
 			if cb := l.LoginCallBack; cb != nil {

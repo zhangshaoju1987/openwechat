@@ -17,41 +17,29 @@ type Bot struct {
 	UUIDCallback        func(uuid string)             // 获取UUID的回调函数
 	SyncCheckCallback   func(resp SyncCheckResponse)  // 心跳回调
 	MessageHandler      MessageHandler                // 获取消息成功的handle
-	MessageErrorHandler func(err error) bool          // 获取消息发生错误的handle, 返回true则尝试继续监听
+	MessageErrorHandler MessageErrorHandler           // 获取消息发生错误的handle, 返回err == nil 则尝试继续监听
 	Serializer          Serializer                    // 序列化器, 默认为json
-	Storage             *Storage
 	Caller              *Caller
+	Storage             *Session
 	err                 error
 	context             context.Context
-	cancel              context.CancelFunc
+	cancel              func()
 	self                *Self
 	hotReloadStorage    HotReloadStorage
 	uuid                string
-	loginUUID           *string
+	loginUUID           string
 	deviceId            string // 设备Id
 	loginOptionGroup    BotOptionGroup
 }
 
 // Alive 判断当前用户是否正常在线
 func (b *Bot) Alive() bool {
-	if b.self == nil {
-		return false
-	}
 	select {
 	case <-b.context.Done():
 		return false
 	default:
-		return true
+		return b.self != nil
 	}
-}
-
-// SetDeviceId
-// @description: 设置设备Id
-// @receiver b
-// @param deviceId
-// TODO ADD INTO LOGIN OPTION
-func (b *Bot) SetDeviceId(deviceId string) {
-	b.deviceId = deviceId
 }
 
 // GetCurrentUser 获取当前的用户
@@ -88,6 +76,7 @@ func (b *Bot) Login() error {
 }
 
 // HotLogin 热登录,可实现在单位时间内免重复扫码登录
+// 热登录需要先扫码登录一次才可以进行热登录
 func (b *Bot) HotLogin(storage HotReloadStorage, opts ...BotLoginOption) error {
 	hotLogin := &HotLogin{storage: storage}
 	// 进行相关设置。
@@ -98,8 +87,6 @@ func (b *Bot) HotLogin(storage HotReloadStorage, opts ...BotLoginOption) error {
 
 // PushLogin 免扫码登录
 // 免扫码登录需要先扫码登录一次才可以进行扫码登录
-// 扫码登录成功后需要利用微信号发送一条消息，然后在手机上进行主动退出。
-// 这时候在进行一次 PushLogin 即可。
 func (b *Bot) PushLogin(storage HotReloadStorage, opts ...BotLoginOption) error {
 	pushLogin := &PushLogin{storage: storage}
 	// 进行相关设置。
@@ -112,19 +99,19 @@ func (b *Bot) PushLogin(storage HotReloadStorage, opts ...BotLoginOption) error 
 func (b *Bot) Logout() error {
 	if b.Alive() {
 		info := b.Storage.LoginInfo
-		if err := b.Caller.Logout(info); err != nil {
+		if err := b.Caller.Logout(b.Context(), info); err != nil {
 			return err
 		}
-		b.Exit()
+		b.ExitWith(ErrUserLogout)
 		return nil
 	}
 	return errors.New("user not login")
 }
 
-// HandleLogin 登录逻辑
-func (b *Bot) HandleLogin(path *url.URL) error {
+// loginFromURL 登录逻辑
+func (b *Bot) loginFromURL(path *url.URL) error {
 	// 获取登录的一些基本的信息
-	info, err := b.Caller.GetLoginInfo(path)
+	info, err := b.Caller.GetLoginInfo(b.Context(), path)
 	if err != nil {
 		return err
 	}
@@ -147,15 +134,15 @@ func (b *Bot) HandleLogin(path *url.URL) error {
 	// 将BaseRequest存到storage里面方便后续调用
 	b.Storage.Request = request
 
-	return b.WebInit()
+	return b.webInit()
 }
 
 // WebInit 根据有效凭证获取和初始化用户信息
-func (b *Bot) WebInit() error {
+func (b *Bot) webInit() error {
 	req := b.Storage.Request
 	info := b.Storage.LoginInfo
 	// 获取初始化的用户信息和一些必要的参数
-	resp, err := b.Caller.WebInit(req)
+	resp, err := b.Caller.WebInit(b.Context(), req)
 	if err != nil {
 		return err
 	}
@@ -176,26 +163,29 @@ func (b *Bot) WebInit() error {
 		}
 	}
 
+	// 构建通知手机客户端已经登录的参数
+	notifyOption := &CallerWebWxStatusNotifyOptions{
+		BaseRequest:     req,
+		WebInitResponse: resp,
+		LoginInfo:       info,
+	}
 	// 通知手机客户端已经登录
-	if err = b.Caller.WebWxStatusNotify(req, resp, info); err != nil {
+	if err = b.Caller.WebWxStatusNotify(b.Context(), notifyOption); err != nil {
 		return err
 	}
 	// 开启协程，轮询获取是否有新的消息返回
 
 	go func() {
 		if b.MessageErrorHandler == nil {
-			b.MessageErrorHandler = defaultSyncCheckErrHandler(b)
+			b.MessageErrorHandler = defaultMessageErrorHandler
 		}
 		for {
-			err := b.syncCheck()
-			if err == nil {
-				continue
-			}
-			// 判断是否继续, 如果不继续则退出
-			if goon := b.MessageErrorHandler(err); !goon {
-				b.err = err
-				b.Exit()
-				break
+			if err = b.syncCheck(); err != nil {
+				// 判断是否继续, 如果不继续则退出
+				if err = b.MessageErrorHandler(err); err != nil {
+					b.ExitWith(err)
+					return
+				}
 			}
 		}
 	}()
@@ -212,11 +202,11 @@ func (b *Bot) updateGroups(msg *Message) {
 		if err != nil {
 			return
 		}
-		user, exist := members.GetByUserName(msg.FromUserName)
+		_, exist := members.GetByUserName(msg.FromUserName)
 		if !exist {
 			// 找不到, 从服务器获取
-			user = newUser(msg.Owner(), msg.FromUserName)
-			err = user.Detail()
+			user := newUser(msg.Owner(), msg.FromUserName)
+			_ = user.Detail()
 			b.self.members = b.self.members.Append(user)
 			b.self.groups = b.self.members.Groups()
 		}
@@ -230,9 +220,16 @@ func (b *Bot) syncCheck() error {
 		err  error
 		resp *SyncCheckResponse
 	)
+
+	syncCheckOption := &CallerSyncCheckOptions{}
+
 	for b.Alive() {
+		// 重制相关参数，因为它们可能是动态的
+		syncCheckOption.BaseRequest = b.Storage.Request
+		syncCheckOption.WebInitResponse = b.Storage.Response
+		syncCheckOption.LoginInfo = b.Storage.LoginInfo
 		// 长轮询检查是否有消息返回
-		resp, err = b.Caller.SyncCheck(b.Storage.Request, b.Storage.LoginInfo, b.Storage.Response)
+		resp, err = b.Caller.SyncCheck(b.Context(), syncCheckOption)
 		if err != nil {
 			return err
 		}
@@ -275,12 +272,20 @@ func (b *Bot) syncCheck() error {
 
 // 获取新的消息
 func (b *Bot) syncMessage() ([]*Message, error) {
-	resp, err := b.Caller.WebWxSync(b.Storage.Request, b.Storage.Response, b.Storage.LoginInfo)
+	opt := CallerWebWxSyncOptions{
+		BaseRequest:     b.Storage.Request,
+		WebInitResponse: b.Storage.Response,
+		LoginInfo:       b.Storage.LoginInfo,
+	}
+	resp, err := b.Caller.WebWxSync(b.Context(), &opt)
 	if err != nil {
 		return nil, err
 	}
-	// 更新SyncKey并且重新存入storage
-	b.Storage.Response.SyncKey = resp.SyncKey
+
+	// 更新SyncKey并且重新存入storage 如获取到的SyncKey为空则不更新
+	if resp.SyncKey.Count > 0 {
+		b.Storage.Response.SyncKey = resp.SyncKey
+	}
 	return resp.AddMsgList, nil
 }
 
@@ -295,11 +300,17 @@ func (b *Bot) Block() error {
 
 // Exit 主动退出，让 Block 不在阻塞
 func (b *Bot) Exit() {
+	b.self = nil
+	b.cancel()
 	if b.LogoutCallBack != nil {
 		b.LogoutCallBack(b)
 	}
-	b.self = nil
-	b.cancel()
+}
+
+// ExitWith 主动退出并且设置退出原因, 可以通过 `CrashReason` 获取退出原因
+func (b *Bot) ExitWith(err error) {
+	b.err = err
+	b.Exit()
 }
 
 // CrashReason 获取当前Bot崩溃的原因
@@ -340,15 +351,6 @@ func (b *Bot) UUID() string {
 	return b.uuid
 }
 
-// SetUUID
-// @description: 设置UUID，可以用来手动登录用
-// @receiver b
-// @param UUID
-// TODO ADD INTO LOGIN OPTION
-func (b *Bot) SetUUID(uuid string) {
-	b.loginUUID = &uuid
-}
-
 // Context returns current context of bot
 func (b *Bot) Context() context.Context {
 	return b.context
@@ -385,11 +387,15 @@ func NewBot(c context.Context) *Bot {
 	ctx, cancel := context.WithCancel(c)
 	return &Bot{
 		Caller:     caller,
-		Storage:    &Storage{},
+		Storage:    &Session{},
 		Serializer: &JsonSerializer{},
 		context:    ctx,
 		cancel:     cancel,
 	}
+}
+
+func New(ctx context.Context) *Bot {
+	return NewBot(ctx)
 }
 
 // DefaultBot 默认的Bot的构造方法,
@@ -419,19 +425,8 @@ func DefaultBot(prepares ...BotPreparer) *Bot {
 	return bot
 }
 
-// defaultSyncCheckErrHandler 默认的SyncCheck错误处理函数
-func defaultSyncCheckErrHandler(bot *Bot) func(error) bool {
-	return func(err error) bool {
-		var ret Ret
-		if errors.As(err, &ret) {
-			switch ret {
-			case failedLoginCheck, cookieInvalid, failedLoginWarn:
-				_ = bot.Logout()
-				return false
-			}
-		}
-		return true
-	}
+func Default(prepares ...BotPreparer) *Bot {
+	return DefaultBot(prepares...)
 }
 
 // GetQrcodeUrl 通过uuid获取登录二维码的url

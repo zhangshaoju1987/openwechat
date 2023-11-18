@@ -3,8 +3,8 @@ package openwechat
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -14,13 +14,15 @@ import (
 	"unsafe"
 )
 
-func ToBuffer(v interface{}) (*bytes.Buffer, error) {
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
+func jsonEncode(v interface{}) (io.Reader, error) {
+	var buffer = bytes.NewBuffer(nil)
+	encoder := json.NewEncoder(buffer)
 	// 这里要设置禁止html转义
 	encoder.SetEscapeHTML(false)
-	err := encoder.Encode(v)
-	return &buffer, err
+	if err := encoder.Encode(v); err != nil {
+		return nil, err
+	}
+	return buffer, nil
 }
 
 // GetRandomDeviceId 获取随机设备id
@@ -37,7 +39,7 @@ func GetRandomDeviceId() string {
 }
 
 // GetFileContentType 获取文件上传的类型
-func GetFileContentType(file multipart.File) (string, error) {
+func GetFileContentType(file io.Reader) (string, error) {
 	data := make([]byte, 512)
 	if _, err := file.Read(data); err != nil {
 		return "", err
